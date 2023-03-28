@@ -11,10 +11,200 @@ knitr::opts_chunk$set(message = FALSE, warning = FALSE)
 library(tidyverse)
 library(lattice)
 library(NHANES)
-library(dplyr)
 library(caret)
 library(randomForest)
 ```
 
-use up sampling
+### Data Cleaning
+```{r data_prep}
+data("NHANES")
+
+nhanes = NHANES %>% 
+  select(Age, Race1, Education, Poverty, Weight, Height, Pulse, Diabetes, BMI, PhysActive, Smoke100, BPSysAve, BPDiaAve, TotChol) %>% 
+  drop_na() %>% 
+  distinct()
+```
+
+### Partition data into training/testing
+
+```{r partition}
+set.seed(123)
+
+train.index = createDataPartition(nhanes$Diabetes, p = 0.7, list = F)
+training = nhanes[train.index, ]
+testing = nhanes[-train.index, ]
+```
+
+### Random Forest
+
+From the class exercise, we found that the accuracy did not increase as the *ntree* increased, so in this assignment we will keep *ntree* = 100.
+```{r}
+set.seed(123)
+
+# Try different values for mtry
+mtry.grid = expand.grid(.mtry = (1:13)) 
+
+control.settings = trainControl(method = "cv", number = 5, sampling = "up")
+
+rf_nhanes = train(Diabetes ~ ., data = training, method = "rf", metric = "Accuracy", tuneGrid = mtry.grid, trControl = control.settings, ntree = 100, importance = TRUE)
+
+confusionMatrix(rf_nhanes)
+rf_nhanes$results
+rf_nhanes$bestTune
+# mtry = 4 is the best tune
+
+mtry.grid = expand.grid(.mtry = rf_nhanes$bestTune)
+
+rf_nhanes_tuned = train(Diabetes ~ ., data = training, method = "rf", trControl = control.settings, metric = "Accuracy", tuneGrid = mtry.grid, importance=TRUE, ntree = 100)
+
+confusionMatrix(rf_nhanes_tuned)
+varImp(rf_nhanes_tuned)
+varImpPlot(rf_nhanes_tuned$finalModel)
+```
+
+### Model 2: Support Vector Classifier
+
+```{r}
+set.seed(123)
+
+tune_grid = expand.grid(C = seq(0.0001,100, length = 50))
+
+control.settings = trainControl(method = "cv", number = 5, sampling = "up", classProbs = TRUE)
+
+# Repeat expanding the grid search
+svc_nhanes = train(Diabetes ~ ., data = training, method = "svmLinear", trControl = control.settings, preProcess = c("center", "scale"), probability = TRUE, tuneGrid = tune_grid)
+
+svc_nhanes$bestTune
+svc_nhanes$results
+confusionMatrix(svc_nhanes)
+```
+
+### Model 3: Logistic Regression
+
+```{r}
+set.seed(123)
+
+control.settings = trainControl(method = "cv", number = 5, sampling = "up")
+
+logit_nhanes = train(Diabetes ~ ., data = training, method = "glm", family = "binomial", preProcess = c("center", "scale"), trControl = control.settings)
+
+logit_nhanes$results
+confusionMatrix(logit_nhanes)
+coef(logit_nhanes$finalModel)
+```
+
+### Output predicted probabilities from each of the three models applied within the testing set. 
+
+```{r}
+# Predict in test-set and output probabilities
+rf.probs = predict(rf_nhanes, testing, type = "prob")
+# Interpretation: Individual #1 has 1% chance of having diabetes; Individual #2 has 23% chance of having diabetes...
+
+# Pull out predicted probabilities for Diabetes = Yes
+rf.pp = rf.probs[ , 2]
+
+svc.probs = predict(svc_nhanes, testing, type = "prob")
+# Interpretation: Individual #1 has 10% chance of having diabetes; Individual #2 has 23% chance of having diabetes...
+svc.pp = svc.probs[ , 2]
+
+# Predict in test-set using response type
+logit.probs = predict(logit_nhanes, testing, type = "prob")
+# Interpretation: Individual #1 has 9% chance of having diabetes; Individual #2 has 22% chance of having diabetes...
+logit.pp = logit.probs[ , 2]
+```
+
+### Plot and compare calibration curves across the three algorithms. 
+
+```{r}
+# Put all the predicted probabilities from all three models into one dataframe so we can plot it for visualization
+predicted_probs = data.frame(Class = testing$Diabetes, logit = logit.pp, rf = rf.pp, svc = svc.pp)
+
+calibration_plot = (calibration(Class ~ logit + rf + svc, data = predicted_probs, class = "Yes", cuts = 10)) 
+
+xyplot(calibration_plot, auto.key = list(columns = 3))
+```
+
+## Post-hoc Calibration
+
+### Calibrate the probabilities from SVC and Random Forest
+
+#### Platt's Scaling 
+
+Partition testing data into 2 sets: 1 set to train calibration and 1 set to evaluate results
+```{r}
+set.seed(123)
+
+# Partition testing data into a 50/50 split
+test.index = testing$Diabetes %>% createDataPartition(p = 0.5, list = F)
+
+# One set for calibration
+calibration_data = testing[test.index, ]
+# Another set for testing
+final.test.data = testing[-test.index, ]
+```
+
+**Calibration of Random Forest**
+```{r}
+# Predict on test set without scaling to obtain raw predicted probabilities in test set
+rf.probs.nocal = predict(rf_nhanes, final.test.data, type = "prob")
+rf.pp.nocal = rf.probs.nocal[ , 2]
+
+# Apply model developed on training data to calibration dataset to obtain predictions
+rf.probs.cal = predict(rf_nhanes, calibration_data, type = "prob")
+rf.pp.cal = rf.probs.cal[ , 2]
+
+# Add to dataset with actual values from calibration data
+rf_cal_df = data.frame(rf.pp.cal, calibration_data$Diabetes)
+colnames(rf_cal_df) = c("x", "y")
+
+# Use logistic regression to model predicted probabilities from calibration data to actual vales
+rf_calibrated = glm(y ~ x, data = rf_cal_df, family = binomial)
+
+# Apply calibration model above to raw predicted probabilities from test set
+rf_test_df = data.frame(rf.pp.nocal)
+colnames(rf_test_df) = c("x")
+platt.data.rf = predict(rf_calibrated, rf_test_df, type = "response")
+
+platt.prob.rf = data.frame(Class = final.test.data$Diabetes, rf.platt = platt.data.rf, rf = rf.pp.nocal)
+
+calplot.rf = (calibration(Class ~ rf.platt + rf, data = platt.prob.rf, class = "Yes", cuts = 10))
+xyplot(calplot.rf, auto.key = list(columns = 2))
+```
+
+**Calibration of SVC**
+```{r}
+# Predict on test-set without scaling
+svc.nocal = predict(svc_nhanes, final.test.data, type = "prob")
+svc.pp.nocal = svc.nocal[ , 2]
+
+# Apply model developed on training data to calibration dataset to obtain predictions
+svc.cal = predict(svc_nhanes, calibration_data, type = "prob")
+svc.pp.cal = svc.cal[ , 2]
+
+# Add to dataset with actual values from calibration data
+svc_cal_df = data.frame(svc.pp.cal, calibration_data$Diabetes)
+colnames(svc_cal_df) = c("x", "y")
+
+# Use logistic regression to model predicted probabilities from calibration data to actual vales
+svc_calibrated = glm(y ~ x, data = svc_cal_df, family = binomial)
+
+# Predict on test set using model developed in calibration
+svc_test_df = data.frame(svc.pp.nocal)
+colnames(svc_test_df) = c("x")
+platt.data.svc = predict(svc_calibrated, svc_test_df, type = "response")
+
+platt.prob.svc = data.frame(Class = final.test.data$Diabetes, svc.platt = platt.data.svc, svc = svc.pp.nocal)
+
+calplot.svc = (calibration(Class ~ svc.platt + svc, data = platt.prob.svc, class = "Yes", cuts = 10))
+xyplot(calplot.svc, auto.key = list(columns = 2))
+```
+
+### Choose the "optimal" model
+
+According to both the pre- and post-calibration plots, I think the **Random Forest** model would be the best model among all three models. In the pre-calibration plot, the random forest model is the one closest to the diagonal line. In the post-calibration plot for random forest, the predictions of diabetes are close to the diagonal line up until 65-70%. In contrast, the SVC model (in the post-calibration plot) is only well-calibrated up until 45-50%.
+
+### Additional Evaluation
+
+If the goal was to implement this model within a clinical setting, I would perform a ConfusionMatrix and ROC curve to determine the sensitivity and specificity of the model, so that I can ensure that this calibrated model is accurate, reliable, and appropriate.
+
 

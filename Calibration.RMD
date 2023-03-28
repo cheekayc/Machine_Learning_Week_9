@@ -45,7 +45,7 @@ The calculation of the clinical risk scores will be demonstrated within class.As
 
 The code below will load the data and process it. 
 
-1. Subsetting the data to only include the relevent features
+1. Subsetting the data to only include the relevant features
 2. Removing observations with missing values
 
 Remember from our prior assignment the data are imbalanced, so we will need to deal with this during our analysis.
